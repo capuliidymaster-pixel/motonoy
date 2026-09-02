@@ -1,0 +1,61 @@
+name: moto
+description: "MotoGuard Flutter project"
+publish_to: 'none'
+
+version: 1.0.0+1
+
+environment:
+  sdk: ">=3.3.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # ================= LOGGING =================
+  logger: ^2.0.0
+
+  # ================= UI =================
+  cupertino_icons: ^1.0.8
+  intl: ^0.20.2
+  get: ^4.7.3
+  google_fonts: ^6.2.1
+
+  # ================= STORAGE =================
+  shared_preferences: ^2.2.3
+
+  # ================= MAP & LOCATION =================
+  flutter_map: ^7.0.2
+  latlong2: ^0.9.1
+  geolocator: ^13.0.1
+
+  # ================= FIREBASE =================
+  firebase_core: ^3.15.2
+  firebase_auth: ^5.7.0
+  cloud_firestore: ^5.6.12
+  firebase_database: ^11.3.10
+
+  # ================= NOTIFICATIONS =================
+  flutter_local_notifications: ^19.1.0
+
+  # ================= NETWORK =================
+  http: ^1.6.0
+  url_launcher: ^6.3.0
+
+  # ================= OTP =================
+  pin_code_fields: ^8.0.1
+
+  # ================= IMAGE PICKER =================
+  image_picker: ^1.0.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+
+flutter:
+  uses-material-design: true
+
+  assets:
+    - assets/startpage.png
+    - assets/quad_bike.png
+    - assets/bike.png
