@@ -1,0 +1,1152 @@
+import 'dart:async';
+import 'dart:math' as math;
+
+import 'package:flutter/material.dart';
+import 'package:flutter_map/flutter_map.dart';
+import 'package:latlong2/latlong.dart';
+import 'package:geolocator/geolocator.dart';
+import 'package:firebase_database/firebase_database.dart';
+
+// ======================================================================
+// GPS DATA MODEL
+// ======================================================================
+
+class GPSData {
+  final double latitude;
+  final double longitude;
+  final double? altitude;
+  final double? speed;
+  final double? accuracy;
+  final int? satellites;
+  final DateTime timestamp;
+  final DateTime?
+      deviceTimestamp; // actual time reported by the device (updatedAt)
+
+  GPSData({
+    required this.latitude,
+    required this.longitude,
+    this.altitude,
+    this.speed,
+    this.accuracy,
+    this.satellites,
+    required this.timestamp,
+    this.deviceTimestamp,
+  });
+
+  bool isValid() {
+    return latitude >= -90 &&
+        latitude <= 90 &&
+        longitude >= -180 &&
+        longitude <= 180;
+  }
+}
+
+// ======================================================================
+// CONNECTION STATUS ENUM
+// ======================================================================
+
+enum ConnectionStatus {
+  disconnected,
+  searching,
+  connecting,
+  connected,
+  error,
+  reconnecting,
+}
+
+// ======================================================================
+// MAP PAGE (LIVE TRACKING)
+// ======================================================================
+
+class MapPage extends StatefulWidget {
+  const MapPage({super.key});
+
+  @override
+  State<MapPage> createState() => _MapPageState();
+}
+
+class _MapPageState extends State<MapPage> {
+  // ====================================================================
+  // MAP CONTROLLER
+  // ====================================================================
+
+  final MapController _mapController = MapController();
+  bool _isMapReady = false;
+
+  // ====================================================================
+  // PHONE GPS
+  // ====================================================================
+
+  StreamSubscription<Position>? _phoneSubscription;
+  LatLng? phoneLocation;
+  GPSData? phoneGPSData;
+  ConnectionStatus phoneStatus = ConnectionStatus.searching;
+  String phoneStatusMessage = "Starting phone GPS...";
+  DateTime? lastPhoneUpdate;
+
+  // ====================================================================
+  // ESP32 / NEO-6M GPS (VIA FIREBASE REALTIME DATABASE)
+  // ====================================================================
+
+  // Points at the same node the ESP32 writes to:
+  // /motorcycle/latitude, /motorcycle/longitude, /motorcycle/satellites,
+  // /motorcycle/speed, /motorcycle/accuracy, /motorcycle/updatedAt,
+  // /motorcycle/gpsStatus
+  final DatabaseReference _motorcycleRef =
+      FirebaseDatabase.instance.ref("motorcycle");
+
+  // Firebase's own "am I actually connected to the server" node.
+  // This is the real way to know if the app has a live connection,
+  // separate from whether the /motorcycle node has data yet.
+  final DatabaseReference _connectedRef =
+      FirebaseDatabase.instance.ref(".info/connected");
+
+  StreamSubscription<DatabaseEvent>? _espSubscription;
+  StreamSubscription<DatabaseEvent>? _firebaseConnectionSubscription;
+
+  LatLng? espLocation;
+  GPSData? espGPSData;
+  ConnectionStatus espStatus = ConnectionStatus.searching;
+  String espStatusMessage = "Waiting for motorcycle GPS...";
+  DateTime? lastESPUpdate;
+  bool _firebaseConnected = false;
+
+  // If no update arrives within this window, we mark the ESP32 as
+  // "stale" (still has a last-known point, but flagged as not live).
+  static const Duration _espStaleTimeout = Duration(seconds: 8);
+  Timer? _espStaleCheckTimer;
+
+  // ====================================================================
+  // METRICS
+  // ====================================================================
+
+  double? distanceBetweenDevices; // in meters
+  double? bearing; // in degrees
+
+  // ====================================================================
+  // INIT
+  // ====================================================================
+
+  @override
+  void initState() {
+    super.initState();
+    _startPhoneGPS();
+    _listenFirebaseConnection();
+    _startESP32GPS();
+
+    // Periodically check if the last Firebase update is too old,
+    // so the UI can show "signal lost" instead of a frozen "connected".
+    _espStaleCheckTimer =
+        Timer.periodic(const Duration(seconds: 2), (_) => _checkESPStale());
+  }
+
+  // ====================================================================
+  // DISPOSE
+  // ====================================================================
+
+  @override
+  void dispose() {
+    _phoneSubscription?.cancel();
+    _espSubscription?.cancel();
+    _firebaseConnectionSubscription?.cancel();
+    _espStaleCheckTimer?.cancel();
+    _mapController.dispose();
+    super.dispose();
+  }
+
+  // ====================================================================
+  // PHONE GPS
+  // ====================================================================
+
+  Future<void> _startPhoneGPS() async {
+    try {
+      if (!mounted) return;
+      setState(() {
+        phoneStatus = ConnectionStatus.searching;
+        phoneStatusMessage = "Checking location services...";
+      });
+
+      // Check if location services are enabled
+      bool serviceEnabled = await Geolocator.isLocationServiceEnabled();
+      if (!serviceEnabled) {
+        if (!mounted) return;
+        setState(() {
+          phoneStatus = ConnectionStatus.error;
+          phoneStatusMessage = "Location services disabled";
+        });
+        return;
+      }
+
+      // Check location permission
+      LocationPermission permission = await Geolocator.checkPermission();
+      if (permission == LocationPermission.denied) {
+        permission = await Geolocator.requestPermission();
+        if (permission == LocationPermission.denied) {
+          if (!mounted) return;
+          setState(() {
+            phoneStatus = ConnectionStatus.error;
+            phoneStatusMessage = "Location permission denied";
+          });
+          return;
+        }
+      }
+
+      if (permission == LocationPermission.deniedForever) {
+        if (!mounted) return;
+        setState(() {
+          phoneStatus = ConnectionStatus.error;
+          phoneStatusMessage = "Location permission permanently denied";
+        });
+        return;
+      }
+
+      // Get initial position
+      if (!mounted) return;
+      setState(() {
+        phoneStatus = ConnectionStatus.connecting;
+        phoneStatusMessage = "Acquiring initial position...";
+      });
+
+      Position position = await Geolocator.getCurrentPosition(
+        locationSettings: const LocationSettings(
+          accuracy: LocationAccuracy.bestForNavigation,
+        ),
+      ).timeout(
+        const Duration(seconds: 30),
+        onTimeout: () => throw Exception("Position timeout"),
+      );
+
+      if (!mounted) return;
+
+      final now = DateTime.now();
+      final gpsData = GPSData(
+        latitude: position.latitude,
+        longitude: position.longitude,
+        altitude: position.altitude,
+        speed: position.speed,
+        accuracy: position.accuracy,
+        timestamp: now,
+      );
+
+      setState(() {
+        phoneLocation = LatLng(position.latitude, position.longitude);
+        phoneGPSData = gpsData;
+        lastPhoneUpdate = now;
+        phoneStatus = ConnectionStatus.connected;
+        phoneStatusMessage = "Phone GPS connected";
+      });
+
+      debugPrint(
+        "✓ Phone GPS Initial: Lat=${position.latitude}, Lon=${position.longitude}",
+      );
+
+      // Start continuous position stream
+      const LocationSettings settings = LocationSettings(
+        accuracy: LocationAccuracy.bestForNavigation,
+        distanceFilter: 2,
+      );
+
+      _phoneSubscription = Geolocator.getPositionStream(
+        locationSettings: settings,
+      ).listen(
+        (Position position) {
+          if (!mounted) return;
+
+          final now = DateTime.now();
+          final gpsData = GPSData(
+            latitude: position.latitude,
+            longitude: position.longitude,
+            altitude: position.altitude,
+            speed: position.speed,
+            accuracy: position.accuracy,
+            timestamp: now,
+          );
+
+          setState(() {
+            phoneLocation = LatLng(position.latitude, position.longitude);
+            phoneGPSData = gpsData;
+            lastPhoneUpdate = now;
+            phoneStatus = ConnectionStatus.connected;
+            phoneStatusMessage = "Phone GPS connected";
+          });
+
+          _calculateMetrics();
+
+          debugPrint(
+            "📍 Phone: Lat=${position.latitude}, Lon=${position.longitude}, Acc=${position.accuracy}m",
+          );
+        },
+        onError: (error) {
+          if (!mounted) return;
+          setState(() {
+            phoneStatus = ConnectionStatus.error;
+            phoneStatusMessage = "Phone GPS error: $error";
+          });
+          debugPrint("❌ Phone GPS Error: $error");
+        },
+      );
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        phoneStatus = ConnectionStatus.error;
+        phoneStatusMessage = "Phone GPS error: $e";
+      });
+      debugPrint("❌ Phone GPS Exception: $e");
+    }
+  }
+
+  // ====================================================================
+  // FIREBASE CONNECTION STATE (".info/connected")
+  // ====================================================================
+  //
+  // This tells us whether the app itself has a live socket connection
+  // to the Firebase Realtime Database server, regardless of whether the
+  // ESP32 has written any data yet. Without this, "no data yet" and
+  // "phone has no internet" look identical to the user.
+  // ====================================================================
+
+  void _listenFirebaseConnection() {
+    _firebaseConnectionSubscription?.cancel();
+
+    _firebaseConnectionSubscription = _connectedRef.onValue.listen(
+      (DatabaseEvent event) {
+        if (!mounted) return;
+
+        final connected = event.snapshot.value as bool? ?? false;
+        _firebaseConnected = connected;
+
+        debugPrint(connected
+            ? "✓ Firebase: connected to server"
+            : "❌ Firebase: not connected to server");
+
+        if (!connected) {
+          setState(() {
+            espStatus = ConnectionStatus.disconnected;
+            espStatusMessage = "No internet / Firebase unreachable";
+          });
+        } else if (espLocation == null) {
+          // Connected to Firebase but haven't received motorcycle
+          // data yet (e.g. ESP32 is off or hasn't sent a fix).
+          setState(() {
+            espStatus = ConnectionStatus.searching;
+            espStatusMessage = "Waiting for motorcycle GPS...";
+          });
+        }
+      },
+      onError: (error) {
+        debugPrint("❌ Firebase connection listener error: $error");
+      },
+    );
+  }
+
+  // ====================================================================
+  // ESP32 / NEO-6M GPS — FIREBASE REALTIME DATABASE LISTENER
+  // ====================================================================
+  //
+  // This replaces the old USB-serial reading. The ESP32 firmware writes
+  // to /motorcycle/latitude, /motorcycle/longitude, /motorcycle/satellites,
+  // /motorcycle/speed, /motorcycle/accuracy, /motorcycle/updatedAt and
+  // /motorcycle/gpsStatus every ~5 seconds once the NEO-6M has a fix.
+  // We just subscribe to that node and update the UI live.
+  // ====================================================================
+
+  void _startESP32GPS() {
+    if (!mounted) return;
+
+    setState(() {
+      espStatus = ConnectionStatus.searching;
+      espStatusMessage = "Connecting to Firebase...";
+    });
+
+    _espSubscription?.cancel();
+
+    _espSubscription = _motorcycleRef.onValue.listen(
+      (DatabaseEvent event) {
+        if (!mounted) return;
+
+        final raw = event.snapshot.value;
+
+        if (raw == null) {
+          setState(() {
+            espStatus = ConnectionStatus.disconnected;
+            espStatusMessage = "No motorcycle data yet";
+          });
+          return;
+        }
+
+        try {
+          final data = Map<String, dynamic>.from(raw as Map);
+
+          final latitude = _asDouble(data["latitude"]);
+          final longitude = _asDouble(data["longitude"]);
+
+          if (latitude == null || longitude == null) {
+            setState(() {
+              espStatus = ConnectionStatus.error;
+              espStatusMessage = "Incomplete GPS data from device";
+            });
+            return;
+          }
+
+          // Validate coordinates
+          if (latitude < -90 ||
+              latitude > 90 ||
+              longitude < -180 ||
+              longitude > 180) {
+            debugPrint("❌ Invalid coordinates: $latitude, $longitude");
+            setState(() {
+              espStatus = ConnectionStatus.error;
+              espStatusMessage = "Invalid coordinates received";
+            });
+            return;
+          }
+
+          final satellites = _asInt(data["satellites"]);
+          final speed = _asDouble(data["speed"]);
+          final accuracy = _asDouble(data["accuracy"]);
+          final gpsStatusText = data["gpsStatus"]?.toString();
+
+          // Device-reported timestamp (Unix ms), if present, tells us
+          // how fresh the GPS fix actually is at the source.
+          final updatedAtMs = _asInt(data["updatedAt"]);
+          final deviceTimestamp = (updatedAtMs != null && updatedAtMs > 0)
+              ? DateTime.fromMillisecondsSinceEpoch(updatedAtMs)
+              : null;
+
+          final now = DateTime.now();
+          final gpsData = GPSData(
+            latitude: latitude,
+            longitude: longitude,
+            satellites: satellites,
+            speed: speed,
+            accuracy: accuracy,
+            timestamp: now,
+            deviceTimestamp: deviceTimestamp,
+          );
+
+          setState(() {
+            espLocation = LatLng(latitude, longitude);
+            espGPSData = gpsData;
+            lastESPUpdate = now;
+            espStatus = ConnectionStatus.connected;
+            espStatusMessage = gpsStatusText != null
+                ? "Motorcycle GPS: $gpsStatusText"
+                : "Motorcycle GPS connected";
+          });
+
+          _calculateMetrics();
+
+          debugPrint(
+            "📍 ESP32/NEO-6M: Lat=$latitude, Lon=$longitude, Sats=$satellites, "
+            "Speed=$speed, Acc=$accuracy",
+          );
+        } catch (e) {
+          debugPrint("❌ Firebase GPS Parse Error: $e | raw: $raw");
+          setState(() {
+            espStatus = ConnectionStatus.error;
+            espStatusMessage = "Error reading GPS data";
+          });
+        }
+      },
+      onError: (error) {
+        if (!mounted) return;
+        setState(() {
+          espStatus = ConnectionStatus.error;
+          espStatusMessage = "Firebase error: $error";
+        });
+        debugPrint("❌ Firebase Listener Error: $error");
+      },
+    );
+  }
+
+  // ====================================================================
+  // STALE CHECK — flags the motorcycle marker if no fresh update
+  // has arrived recently (e.g. ESP32 lost WiFi or GPS fix)
+  // ====================================================================
+
+  void _checkESPStale() {
+    if (!mounted) return;
+    if (lastESPUpdate == null) return;
+    if (espStatus != ConnectionStatus.connected) return;
+
+    final elapsed = DateTime.now().difference(lastESPUpdate!);
+    if (elapsed > _espStaleTimeout) {
+      setState(() {
+        espStatus = ConnectionStatus.disconnected;
+        espStatusMessage = "Signal lost - last known position shown";
+      });
+    }
+  }
+
+  // ====================================================================
+  // SAFE NUMBER PARSING HELPERS (Firebase can return int or double)
+  // ====================================================================
+
+  double? _asDouble(dynamic value) {
+    if (value == null) return null;
+    if (value is double) return value;
+    if (value is int) return value.toDouble();
+    return double.tryParse(value.toString());
+  }
+
+  int? _asInt(dynamic value) {
+    if (value == null) return null;
+    if (value is int) return value;
+    if (value is double) return value.toInt();
+    return int.tryParse(value.toString());
+  }
+
+  // ====================================================================
+  // CALCULATE METRICS
+  // ====================================================================
+
+  void _calculateMetrics() {
+    if (phoneLocation != null && espLocation != null) {
+      // Calculate distance using Haversine formula
+      final distance = _calculateDistance(
+        phoneLocation!.latitude,
+        phoneLocation!.longitude,
+        espLocation!.latitude,
+        espLocation!.longitude,
+      );
+
+      // Calculate bearing
+      final newBearing = _calculateBearing(
+        phoneLocation!.latitude,
+        phoneLocation!.longitude,
+        espLocation!.latitude,
+        espLocation!.longitude,
+      );
+
+      if (!mounted) return;
+      setState(() {
+        distanceBetweenDevices = distance;
+        bearing = newBearing;
+      });
+    }
+  }
+
+  // Haversine distance formula (returns meters)
+  double _calculateDistance(
+      double lat1, double lon1, double lat2, double lon2) {
+    const R = 6371000; // Earth radius in meters
+    final dLat = _toRad(lat2 - lat1);
+    final dLon = _toRad(lon2 - lon1);
+    final a = math.sin(dLat / 2) * math.sin(dLat / 2) +
+        math.cos(_toRad(lat1)) *
+            math.cos(_toRad(lat2)) *
+            math.sin(dLon / 2) *
+            math.sin(dLon / 2);
+    final c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a));
+    return R * c;
+  }
+
+  // Calculate bearing (returns degrees 0-360)
+  double _calculateBearing(double lat1, double lon1, double lat2, double lon2) {
+    final dLon = _toRad(lon2 - lon1);
+    final y = math.sin(dLon) * math.cos(_toRad(lat2));
+    final x = math.cos(_toRad(lat1)) * math.sin(_toRad(lat2)) -
+        math.sin(_toRad(lat1)) * math.cos(_toRad(lat2)) * math.cos(dLon);
+    final bearing = math.atan2(y, x);
+    return (_toDeg(bearing) + 360) % 360;
+  }
+
+  double _toRad(double degree) => degree * math.pi / 180;
+  double _toDeg(double radian) => radian * 180 / math.pi;
+
+  // ====================================================================
+  // GET CARDINAL DIRECTION
+  // ====================================================================
+
+  String _getCardinalDirection(double bearing) {
+    const directions = [
+      'N',
+      'NNE',
+      'NE',
+      'ENE',
+      'E',
+      'ESE',
+      'SE',
+      'SSE',
+      'S',
+      'SSW',
+      'SW',
+      'WSW',
+      'W',
+      'WNW',
+      'NW',
+      'NNW'
+    ];
+    final index = ((bearing + 11.25) / 22.5).toInt() % 16;
+    return directions[index];
+  }
+
+  // ====================================================================
+  // GET STATUS COLOR
+  // ====================================================================
+
+  Color _getStatusColor(ConnectionStatus status) {
+    switch (status) {
+      case ConnectionStatus.connected:
+        return Colors.green;
+      case ConnectionStatus.connecting:
+      case ConnectionStatus.searching:
+        return Colors.amber;
+      case ConnectionStatus.error:
+      case ConnectionStatus.disconnected:
+        return Colors.red;
+      case ConnectionStatus.reconnecting:
+        return Colors.orange;
+    }
+  }
+
+  // ====================================================================
+  // RECENTER PHONE
+  // ====================================================================
+
+  void _recenterPhone() {
+    if (phoneLocation != null && _isMapReady) {
+      _mapController.move(phoneLocation!, 16);
+    }
+  }
+
+  // ====================================================================
+  // RECENTER ESP32
+  // ====================================================================
+
+  void _recenterESP() {
+    if (espLocation != null && _isMapReady) {
+      _mapController.move(espLocation!, 16);
+    }
+  }
+
+  // ====================================================================
+  // MANUAL RECONNECT (re-attaches the Firebase listeners)
+  // ====================================================================
+
+  void _manualReconnectESP32() {
+    _listenFirebaseConnection();
+    _startESP32GPS();
+  }
+
+  // ====================================================================
+  // FORMAT DISTANCE
+  // ====================================================================
+
+  String _formatDistance(double meters) {
+    if (meters < 1000) {
+      return "${meters.toStringAsFixed(1)} m";
+    } else {
+      return "${(meters / 1000).toStringAsFixed(2)} km";
+    }
+  }
+
+  // ====================================================================
+  // BUILD UI
+  // ====================================================================
+
+  @override
+  Widget build(BuildContext context) {
+    final mapCenter =
+        phoneLocation ?? espLocation ?? const LatLng(14.5995, 120.9842);
+
+    return Scaffold(
+      backgroundColor: const Color(0xFF0D1117),
+      appBar: AppBar(
+        backgroundColor: const Color(0xFF161B22),
+        title: const Text(
+          "Live GPS Tracking",
+          style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
+        ),
+        leading: IconButton(
+          icon: const Icon(Icons.arrow_back, color: Colors.orange),
+          onPressed: () => Navigator.pop(context),
+        ),
+        actions: [
+          // Small Firebase connectivity indicator in the app bar
+          Padding(
+            padding: const EdgeInsets.only(right: 12),
+            child: Center(
+              child: Row(
+                children: [
+                  Icon(
+                    _firebaseConnected ? Icons.cloud_done : Icons.cloud_off,
+                    size: 16,
+                    color: _firebaseConnected ? Colors.green : Colors.red,
+                  ),
+                  const SizedBox(width: 4),
+                  Text(
+                    _firebaseConnected ? "Online" : "Offline",
+                    style: TextStyle(
+                      fontSize: 11,
+                      color: _firebaseConnected ? Colors.green : Colors.red,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ],
+      ),
+      body: Stack(
+        children: [
+          // ============================================================
+          // MAP LAYER
+          // ============================================================
+
+          FlutterMap(
+            mapController: _mapController,
+            options: MapOptions(
+              initialCenter: mapCenter,
+              initialZoom: 16,
+              onMapReady: () {
+                _isMapReady = true;
+              },
+            ),
+            children: [
+              // OpenStreetMap tiles
+              TileLayer(
+                urlTemplate: "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+                userAgentPackageName: "com.example.tracker",
+              ),
+
+              // Markers layer
+              MarkerLayer(
+                markers: [
+                  // Phone marker
+                  if (phoneLocation != null)
+                    Marker(
+                      point: phoneLocation!,
+                      width: 70,
+                      height: 75,
+                      child: Column(
+                        children: [
+                          Container(
+                            decoration: BoxDecoration(
+                              shape: BoxShape.circle,
+                              color: Colors.blue.withValues(alpha: 0.3),
+                            ),
+                            padding: const EdgeInsets.all(8),
+                            child: const Icon(
+                              Icons.phone_android,
+                              color: Colors.blue,
+                              size: 40,
+                            ),
+                          ),
+                          const Text(
+                            "PHONE",
+                            style: TextStyle(
+                              color: Colors.blue,
+                              fontSize: 10,
+                              fontWeight: FontWeight.bold,
+                              backgroundColor: Colors.black54,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+
+                  // ESP32 / NEO-6M motorcycle marker
+                  if (espLocation != null)
+                    Marker(
+                      point: espLocation!,
+                      width: 75,
+                      height: 80,
+                      child: Column(
+                        children: [
+                          Container(
+                            decoration: BoxDecoration(
+                              shape: BoxShape.circle,
+                              color: Colors.orange.withValues(alpha: 0.3),
+                            ),
+                            padding: const EdgeInsets.all(8),
+                            child: const Icon(
+                              Icons.motorcycle,
+                              color: Colors.orange,
+                              size: 42,
+                            ),
+                          ),
+                          const Text(
+                            "MOTOR",
+                            style: TextStyle(
+                              color: Colors.orange,
+                              fontSize: 10,
+                              fontWeight: FontWeight.bold,
+                              backgroundColor: Colors.black54,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                ],
+              ),
+            ],
+          ),
+
+          // ============================================================
+          // TOP STATUS PANEL
+          // ============================================================
+
+          Positioned(
+            top: 12,
+            left: 12,
+            right: 12,
+            child: Container(
+              padding: const EdgeInsets.all(14),
+              decoration: BoxDecoration(
+                color: const Color(0xFF161B22).withValues(alpha: 0.95),
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(color: Colors.white12, width: 1),
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.black.withValues(alpha: 0.5),
+                    blurRadius: 8,
+                    offset: const Offset(0, 4),
+                  ),
+                ],
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  // PHONE GPS STATUS
+                  _buildStatusRow(
+                    icon: Icons.phone_android,
+                    color: Colors.blue,
+                    label: "PHONE",
+                    status: phoneStatusMessage,
+                    connectionStatus: phoneStatus,
+                    gpsData: phoneGPSData,
+                    lastUpdate: lastPhoneUpdate,
+                  ),
+
+                  const SizedBox(height: 12),
+
+                  // ESP32 / NEO-6M GPS STATUS
+                  _buildStatusRow(
+                    icon: Icons.motorcycle,
+                    color: Colors.orange,
+                    label: "MOTOR",
+                    status: espStatusMessage,
+                    connectionStatus: espStatus,
+                    gpsData: espGPSData,
+                    lastUpdate: lastESPUpdate,
+                  ),
+
+                  // DISTANCE AND BEARING
+                  if (distanceBetweenDevices != null && bearing != null) ...[
+                    const SizedBox(height: 12),
+                    Container(
+                      padding: const EdgeInsets.all(10),
+                      decoration: BoxDecoration(
+                        color: Colors.blueGrey.withValues(alpha: 0.2),
+                        borderRadius: BorderRadius.circular(8),
+                        border: Border.all(color: Colors.cyan, width: 1),
+                      ),
+                      child: Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceAround,
+                        children: [
+                          Column(
+                            children: [
+                              const Text(
+                                "Distance",
+                                style: TextStyle(
+                                  color: Colors.white70,
+                                  fontSize: 11,
+                                ),
+                              ),
+                              Text(
+                                _formatDistance(distanceBetweenDevices!),
+                                style: const TextStyle(
+                                  color: Colors.cyan,
+                                  fontSize: 16,
+                                  fontWeight: FontWeight.bold,
+                                ),
+                              ),
+                            ],
+                          ),
+                          Column(
+                            children: [
+                              const Text(
+                                "Bearing",
+                                style: TextStyle(
+                                  color: Colors.white70,
+                                  fontSize: 11,
+                                ),
+                              ),
+                              Text(
+                                "${bearing!.toStringAsFixed(1)}°",
+                                style: const TextStyle(
+                                  color: Colors.cyan,
+                                  fontSize: 16,
+                                  fontWeight: FontWeight.bold,
+                                ),
+                              ),
+                            ],
+                          ),
+                          Column(
+                            children: [
+                              const Text(
+                                "Direction",
+                                style: TextStyle(
+                                  color: Colors.white70,
+                                  fontSize: 11,
+                                ),
+                              ),
+                              Text(
+                                _getCardinalDirection(bearing!),
+                                style: const TextStyle(
+                                  color: Colors.cyan,
+                                  fontSize: 16,
+                                  fontWeight: FontWeight.bold,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+          ),
+
+          // ============================================================
+          // BOTTOM ACTION PANEL
+          // ============================================================
+
+          Positioned(
+            bottom: 16,
+            right: 16,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                // Phone recenter button
+                FloatingActionButton(
+                  heroTag: "phoneRecenter",
+                  backgroundColor: const Color(0xFF161B22),
+                  foregroundColor: Colors.blue,
+                  mini: true,
+                  onPressed: _recenterPhone,
+                  tooltip: "Center on phone",
+                  child: const Icon(Icons.phone_android),
+                ),
+                const SizedBox(height: 8),
+
+                // ESP32 recenter button
+                FloatingActionButton(
+                  heroTag: "espRecenter",
+                  backgroundColor: const Color(0xFF161B22),
+                  foregroundColor: Colors.orange,
+                  mini: true,
+                  onPressed: _recenterESP,
+                  tooltip: "Center on motorcycle",
+                  child: const Icon(Icons.motorcycle),
+                ),
+                const SizedBox(height: 8),
+
+                // Reconnect button (only if disconnected)
+                if (espStatus == ConnectionStatus.disconnected ||
+                    espStatus == ConnectionStatus.error)
+                  FloatingActionButton(
+                    heroTag: "espReconnect",
+                    backgroundColor: Colors.red,
+                    foregroundColor: Colors.white,
+                    mini: true,
+                    onPressed: _manualReconnectESP32,
+                    tooltip: "Reconnect to Firebase",
+                    child: const Icon(Icons.refresh),
+                  ),
+              ],
+            ),
+          ),
+
+          // ============================================================
+          // BOTTOM DATA PANEL
+          // ============================================================
+
+          Positioned(
+            bottom: 16,
+            left: 16,
+            right: 16,
+            child: Align(
+              alignment: Alignment.bottomLeft,
+              child: Container(
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF161B22).withValues(alpha: 0.95),
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(color: Colors.white12, width: 1),
+                ),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    if (phoneGPSData != null) ...[
+                      _buildDataField("Phone Alt",
+                          "${phoneGPSData!.altitude?.toStringAsFixed(1) ?? 'N/A'} m"),
+                      _buildDataField("Phone Acc",
+                          "${phoneGPSData!.accuracy?.toStringAsFixed(1) ?? 'N/A'} m"),
+                    ],
+                    if (espGPSData != null) ...[
+                      _buildDataField(
+                          "MOTOR Sats", "${espGPSData!.satellites ?? 'N/A'}"),
+                      _buildDataField("MOTOR Speed",
+                          "${espGPSData!.speed?.toStringAsFixed(1) ?? 'N/A'} km/h"),
+                      _buildDataField("MOTOR HDOP",
+                          espGPSData!.accuracy?.toStringAsFixed(1) ?? 'N/A'),
+                      if (espGPSData!.deviceTimestamp != null)
+                        _buildDataField(
+                          "MOTOR Last Fix",
+                          _formatTime(espGPSData!.deviceTimestamp!),
+                        ),
+                    ],
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // ====================================================================
+  // BUILD STATUS ROW WIDGET
+  // ====================================================================
+
+  Widget _buildStatusRow({
+    required IconData icon,
+    required Color color,
+    required String label,
+    required String status,
+    required ConnectionStatus connectionStatus,
+    required GPSData? gpsData,
+    required DateTime? lastUpdate,
+  }) {
+    final statusColor = _getStatusColor(connectionStatus);
+
+    return Row(
+      children: [
+        // Connection indicator dot
+        Container(
+          width: 12,
+          height: 12,
+          decoration: BoxDecoration(
+            shape: BoxShape.circle,
+            color: statusColor,
+            boxShadow: [
+              BoxShadow(
+                color: statusColor.withValues(alpha: 0.5),
+                blurRadius: 6,
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(width: 8),
+
+        // Icon
+        Icon(icon, color: color, size: 18),
+        const SizedBox(width: 6),
+
+        // Status text
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  Text(
+                    label,
+                    style: TextStyle(
+                      color: color,
+                      fontSize: 12,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: Text(
+                      status,
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 12,
+                      ),
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                ],
+              ),
+              if (gpsData != null && lastUpdate != null)
+                Text(
+                  "Lat: ${gpsData.latitude.toStringAsFixed(5)}, Lon: ${gpsData.longitude.toStringAsFixed(5)}",
+                  style: const TextStyle(
+                    color: Colors.white70,
+                    fontSize: 10,
+                  ),
+                  overflow: TextOverflow.ellipsis,
+                ),
+            ],
+          ),
+        ),
+
+        // Last update indicator
+        if (lastUpdate != null)
+          Text(
+            _formatTime(lastUpdate),
+            style: const TextStyle(
+              color: Colors.white54,
+              fontSize: 9,
+            ),
+          ),
+      ],
+    );
+  }
+
+  // ====================================================================
+  // BUILD DATA FIELD WIDGET
+  // ====================================================================
+
+  Widget _buildDataField(String label, String value) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 2),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text(
+            "$label: ",
+            style: const TextStyle(
+              color: Colors.white70,
+              fontSize: 11,
+            ),
+          ),
+          Text(
+            value,
+            style: const TextStyle(
+              color: Colors.cyan,
+              fontSize: 11,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // ====================================================================
+  // FORMAT TIME
+  // ====================================================================
+
+  String _formatTime(DateTime dateTime) {
+    final now = DateTime.now();
+    final diff = now.difference(dateTime);
+
+    if (diff.inSeconds < 60) {
+      return "${diff.inSeconds}s ago";
+    } else if (diff.inMinutes < 60) {
+      return "${diff.inMinutes}m ago";
+    } else {
+      return "${diff.inHours}h ago";
+    }
+  }
+}
