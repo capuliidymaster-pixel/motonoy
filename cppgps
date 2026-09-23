@@ -1,0 +1,81 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <Firebase_ESP_Client.h>
+#include <TinyGPSPlus.h>
+
+// =====================================================
+// WIFI
+// =====================================================
+#define WIFI_SSID "qwer"
+#define WIFI_PASSWORD "qwerty123"
+
+// =====================================================
+// FIREBASE
+// =====================================================
+#define API_KEY "AIzaSyClhSx1mA0iwdw6DQmFd3Diz8IJwie3Lhk"
+
+#define DATABASE_URL "https://seretei8-default-rtdb.asia-southeast1.firebasedatabase.app/"
+
+// =====================================================
+// FIREBASE EMAIL ACCOUNT
+// =====================================================
+#define USER_EMAIL "capuliidyamster@gmail.com"
+#define USER_PASSWORD "killertie"
+
+// =====================================================
+// GPS NEO-6M
+// =====================================================
+#define GPS_RX 16
+#define GPS_TX 17
+
+HardwareSerial GPS(2);
+TinyGPSPlus gps;
+
+// =====================================================
+// FIREBASE OBJECTS
+// =====================================================
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+// =====================================================
+// TIMERS
+// =====================================================
+unsigned long lastGPSUpdate = 0;
+
+const unsigned long GPS_UPDATE_INTERVAL = 5000;
+
+// =====================================================
+// SETUP
+// =====================================================
+void setup() {
+
+  Serial.begin(115200);
+  delay(2000);
+
+  Serial.println();
+  Serial.println("=================================");
+  Serial.println("   MOTOGUARD ESP32 GPS");
+  Serial.println("=================================");
+
+  // =================================================
+  // START GPS
+  // =================================================
+  GPS.begin(
+    9600,
+    SERIAL_8N1,
+    GPS_RX,
+    GPS_TX
+  );
+
+  Serial.println("GPS started.");
+
+  // =================================================
+  // CONNECT WIFI
+  // =================================================
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  Serial.print("Connecting to WiFi");
+
+  while (WiFi.status() != WL_CONNECTED) {
