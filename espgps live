@@ -1,0 +1,430 @@
+/*
+ * MotoGuard - NEO-6M -> ESP32 -> Firebase Realtime Database
+ * Library: Firebase_ESP_Client (Mobizt) + TinyGPSPlus
+ *
+ * - GPS is read continuously in loop() (core 1); it is never blocked by network code.
+ * - A separate FreeRTOS task (core 0) uploads to Firebase once per second.
+ * - Only a VALIDATED fix is reported as GPS_ONLINE. Otherwise gpsFix=false / GPS_LOST.
+ * - No fake coordinates are ever generated.
+ */
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <HardwareSerial.h>
+#include <TinyGPSPlus.h>
+#include <Firebase_ESP_Client.h>
+#include <addons/TokenHelper.h>
+
+// =====================================================================
+// CREDENTIALS  (NO semicolons after #define lines!)
+// =====================================================================
+#define WIFI_SSID      "HUAWEI-2.4G-x9Wk"
+#define WIFI_PASSWORD  "KmJ2PUVv"       // <-- EDIT
+
+#define API_KEY        "AIzaSyClhSx1mA0iwdw6DQmFd3Diz8IJwie3Lhk"
+#define DATABASE_URL   "https://seretei8-default-rtdb.asia-southeast1.firebasedatabase.app/"
+
+#define USER_EMAIL     "capuliidymaster@gmail.com" // <-- EDIT
+#define USER_PASSWORD  "killertie"   // <-- EDIT
+
+// Where the live data is written (the new map.dart reads gps/motorcycle_001)
+#define FB_PATH        "/gps/motorcycle_001"
+
+// =====================================================================
+// SETTINGS
+// =====================================================================
+#define RAW_NMEA_DEBUG 0      // 1 = echo raw NMEA sentences to Serial Monitor
+#define USE_LEDS       0      // 1 = drive the 3 status LEDs (pins below)
+
+static const int      GPS_RX_PIN = 16;      // ESP32 RX  <- NEO-6M TX
+static const int      GPS_TX_PIN = 17;      // ESP32 TX  -> NEO-6M RX
+static const uint32_t GPS_BAUD   = 9600;
+
+static const int      LED_GPS_FIX = 23;     // green
+static const int      LED_SENDING = 22;     // blue
+static const int      LED_ERROR   = 21;     // red
+
+// Fix validation rules
+static const int      MIN_SATELLITES   = 4;
+static const double   MAX_HDOP         = 5.0;
+static const uint32_t MAX_FIX_AGE_MS   = 2500;
+static const uint32_t MAX_FIELD_AGE_MS = 3000;
+static const uint32_t NMEA_TIMEOUT_MS  = 3000;
+
+// Diagnostics
+static const uint32_t FROZEN_WARN_SECONDS = 30;
+static const double   JUMP_WARN_METERS    = 50.0;
+static const double   SPEED_DEADBAND_KMH  = 1.0;
+static const double   ACCURACY_PER_HDOP_M = 2.5;   // estimated accuracy = HDOP * 2.5 m
+
+// Network
+static const uint32_t WIFI_RETRY_MS = 8000;
+
+// =====================================================================
+// GLOBALS
+// =====================================================================
+HardwareSerial gpsSerial(2);   // UART2
+TinyGPSPlus    gps;
+
+FirebaseData   fbdo;
+FirebaseAuth   auth;
+FirebaseConfig config;
+
+struct GpsSnapshot {
+  bool     ready        = false;
+  bool     fix          = false;
+  bool     nmeaFlowing  = false;
+  double   lat          = 0;
+  double   lng          = 0;
+  double   alt          = 0;
+  double   speedKmh     = 0;
+  double   hdop         = 99.99;
+  bool     hdopValid    = false;
+  double   accuracy     = 0;
+  int      sats         = 0;
+  int64_t  deviceTsMs   = 0;
+  uint32_t seq          = 0;
+  const char* status    = "GPS_LOST";
+};
+
+GpsSnapshot       g_snap;
+SemaphoreHandle_t g_snapMutex;
+
+volatile bool     g_wifiOk       = false;
+volatile bool     g_fbOk         = false;
+volatile uint32_t g_fbOkCount    = 0;
+volatile uint32_t g_fbFailCount  = 0;
+volatile int      g_lastHttpCode = 0;
+
+// State used only by loop()
+uint32_t lastTickMs       = 0;
+uint32_t lastChars        = 0;
+uint32_t lastCharsMs      = 0;
+uint32_t seqCounter       = 0;
+bool     haveLast         = false;
+double   lastLat          = 0;
+double   lastLng          = 0;
+uint32_t identicalSeconds = 0;
+
+// =====================================================================
+// TIME HELPERS (GPS date+time -> Unix epoch milliseconds)
+// =====================================================================
+static int64_t daysFromCivil(int y, int m, int d) {
+  y -= (m <= 2);
+  const int era = (y >= 0 ? y : y - 399) / 400;
+  const int yoe = y - era * 400;
+  const int doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+  const int doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  return (int64_t)era * 146097 + doe - 719468;
+}
+
+static int64_t gpsEpochMs() {
+  int64_t days = daysFromCivil(gps.date.year(), gps.date.month(), gps.date.day());
+  int64_t secs = days * 86400LL + gps.time.hour() * 3600LL +
+                 gps.time.minute() * 60LL + gps.time.second();
+  return secs * 1000LL + gps.time.centisecond() * 10LL;
+}
+
+// =====================================================================
+// GPS: evaluate fix once per second and publish a snapshot
+// =====================================================================
+static void tickGps() {
+  const uint32_t now = millis();
+
+  uint32_t chars = gps.charsProcessed();
+  if (chars != lastChars) { lastChars = chars; lastCharsMs = now; }
+  const bool flowing = (chars > 0) && (now - lastCharsMs < NMEA_TIMEOUT_MS);
+
+  const bool locValid   = gps.location.isValid();
+  const uint32_t locAge = locValid ? gps.location.age() : 0xFFFFFFFFUL;
+  const bool satsFresh  = gps.satellites.isValid() && gps.satellites.age() <= MAX_FIELD_AGE_MS;
+  const bool hdopFresh  = gps.hdop.isValid() && gps.hdop.age() <= MAX_FIELD_AGE_MS;
+  const bool timeFresh  = gps.date.isValid() && gps.time.isValid() &&
+                          gps.time.age() <= MAX_FIELD_AGE_MS && gps.date.year() >= 2023;
+
+  const int    sats = satsFresh ? (int)gps.satellites.value() : 0;
+  const double hdop = hdopFresh ? gps.hdop.hdop() : 99.99;
+
+  const char* reason = nullptr;
+  if (!flowing)                                  reason = "no NMEA data from NEO-6M";
+  else if (!locValid)                            reason = "no position yet (searching satellites)";
+  else if (locAge > MAX_FIX_AGE_MS)              reason = "position is stale (fix lost)";
+  else if (!satsFresh || sats < MIN_SATELLITES)  reason = "too few satellites";
+  else if (!hdopFresh)                           reason = "HDOP unavailable";
+  else if (hdop > MAX_HDOP)                      reason = "HDOP too high (poor geometry / weak signal)";
+  else if (!timeFresh)                           reason = "GPS date/time not valid";
+
+  bool fix = (reason == nullptr);
+
+  double lat = 0, lng = 0;
+  if (fix) {
+    lat = gps.location.lat();
+    lng = gps.location.lng();
+    if (isnan(lat) || isnan(lng) || lat < -90 || lat > 90 || lng < -180 || lng > 180 ||
+        (fabs(lat) < 0.0001 && fabs(lng) < 0.0001)) {
+      fix = false;
+      reason = "coordinates out of range / 0,0";
+    }
+  }
+
+  bool jumped = false;
+  if (fix) {
+    if (haveLast) {
+      if (fabs(lat - lastLat) < 1e-7 && fabs(lng - lastLng) < 1e-7) identicalSeconds++;
+      else identicalSeconds = 0;
+      double d = TinyGPSPlus::distanceBetween(lastLat, lastLng, lat, lng);
+      jumped = d > JUMP_WARN_METERS;
+    }
+    lastLat = lat; lastLng = lng; haveLast = true;
+  } else {
+    haveLast = false;
+    identicalSeconds = 0;
+  }
+
+  GpsSnapshot s;
+  s.ready       = true;
+  s.fix         = fix;
+  s.nmeaFlowing = flowing;
+  s.sats        = sats;
+  s.hdopValid   = hdopFresh;
+  s.hdop        = hdop;
+  s.seq         = ++seqCounter;
+  if (fix) {
+    double spd = gps.speed.isValid() ? gps.speed.kmph() : 0.0;
+    if (spd < SPEED_DEADBAND_KMH) spd = 0.0;
+    s.lat        = lat;
+    s.lng        = lng;
+    s.alt        = gps.altitude.isValid() ? gps.altitude.meters() : 0.0;
+    s.speedKmh   = spd;
+    s.accuracy   = hdop * ACCURACY_PER_HDOP_M;
+    s.deviceTsMs = gpsEpochMs();
+    s.status     = "GPS_ONLINE";
+  } else {
+    s.status     = flowing ? "GPS_LOST" : "GPS_NO_DATA";
+  }
+
+  xSemaphoreTake(g_snapMutex, portMAX_DELAY);
+  g_snap = s;
+  xSemaphoreGive(g_snapMutex);
+
+#if USE_LEDS
+  digitalWrite(LED_GPS_FIX, fix ? HIGH : LOW);
+  digitalWrite(LED_ERROR, (g_wifiOk && g_fbOk) ? LOW : HIGH);
+#endif
+
+  // ---------------- Serial Monitor output (every second) ----------------
+  Serial.println();
+  if (fix) {
+    Serial.println("GPS FIX");
+    Serial.printf("Latitude: %.6f\n", s.lat);
+    Serial.printf("Longitude: %.6f\n", s.lng);
+    Serial.printf("Altitude: %.2f m\n", s.alt);
+    Serial.printf("Speed: %.2f km/h\n", s.speedKmh);
+    Serial.printf("Satellites: %d\n", s.sats);
+    Serial.printf("HDOP: %.2f  (est. accuracy ~%.1f m)\n", s.hdop, s.accuracy);
+    Serial.printf("GPS UTC: %04d-%02d-%02d %02d:%02d:%02d\n",
+                  gps.date.year(), gps.date.month(), gps.date.day(),
+                  gps.time.hour(), gps.time.minute(), gps.time.second());
+    Serial.println("GPS Status: ONLINE");
+    if (jumped)
+      Serial.printf("WARNING: position jumped > %.0f m in 1 s (multipath / weak signal?)\n", JUMP_WARN_METERS);
+    if (identicalSeconds >= FROZEN_WARN_SECONDS)
+      Serial.printf("WARNING: coordinates identical for %lu s (stationary receiver or frozen data)\n",
+                    (unsigned long)identicalSeconds);
+  } else {
+    Serial.println("GPS STATUS: LOST");
+    Serial.printf("Satellites: %d\n", sats);
+    Serial.printf("Reason: %s\n", reason ? reason : "unknown");
+    if (!flowing) Serial.println("Check wiring (NEO-6M TX -> GPIO16), power and baud rate 9600.");
+    else          Serial.println("Waiting for valid GPS fix...");
+  }
+  Serial.printf("[Net] WiFi: %s rssi=%d | Firebase: %s (ok=%lu fail=%lu, last HTTP=%d)\n",
+                g_wifiOk ? "OK" : "DOWN",
+                g_wifiOk ? WiFi.RSSI() : 0,
+                g_fbOk ? "OK" : "DOWN",
+                (unsigned long)g_fbOkCount, (unsigned long)g_fbFailCount, g_lastHttpCode);
+  Serial.printf("[NMEA] chars=%lu sentencesWithFix=%lu checksumFailed=%lu\n",
+                (unsigned long)gps.charsProcessed(),
+                (unsigned long)gps.sentencesWithFix(),
+                (unsigned long)gps.failedChecksum());
+}
+
+// =====================================================================
+// FIREBASE BODY
+// =====================================================================
+static void buildBody(const GpsSnapshot& s, char* out, size_t n) {
+  char hdopStr[16];
+  if (s.hdopValid) snprintf(hdopStr, sizeof(hdopStr), "%.2f", s.hdop);
+  else             strcpy(hdopStr, "null");
+
+  if (s.fix) {
+    snprintf(out, n,
+      "{\"latitude\":%.6f,\"longitude\":%.6f,\"altitude\":%.1f,\"speed\":%.2f,"
+      "\"accuracy\":%.1f,\"satellites\":%d,\"hdop\":%s,"
+      "\"gpsFix\":true,\"status\":\"GPS_ONLINE\","
+      "\"deviceTimestamp\":%lld,\"seq\":%lu,"
+      "\"updatedAt\":{\".sv\":\"timestamp\"}}",
+      s.lat, s.lng, s.alt, s.speedKmh, s.accuracy, s.sats, hdopStr,
+      (long long)s.deviceTsMs, (unsigned long)s.seq);
+  } else {
+    // No valid fix: last known latitude/longitude/deviceTimestamp stay untouched
+    // (update = PATCH), but the state is clearly flagged. The app never shows them as live.
+    snprintf(out, n,
+      "{\"speed\":0,\"accuracy\":null,\"satellites\":%d,\"hdop\":%s,"
+      "\"gpsFix\":false,\"status\":\"%s\",\"seq\":%lu,"
+      "\"updatedAt\":{\".sv\":\"timestamp\"}}",
+      s.sats, hdopStr, s.status, (unsigned long)s.seq);
+  }
+}
+
+// =====================================================================
+// UPLOAD TASK (core 0). Never blocks GPS reading on core 1.
+// =====================================================================
+static void firebaseTask(void* param) {
+  bool     fbStarted       = false;
+  uint32_t lastSeq         = 0;
+  uint32_t lastWifiRetry   = 0;
+  uint32_t lastNotReadyMsg = 0;
+  char     body[420];
+  FirebaseJson json;
+
+  for (;;) {
+    const uint32_t now = millis();
+
+    // ---- WiFi watchdog / auto-reconnect ----
+    if (WiFi.status() != WL_CONNECTED) {
+      g_wifiOk = false;
+      g_fbOk   = false;
+      if (now - lastWifiRetry >= WIFI_RETRY_MS) {
+        lastWifiRetry = now;
+        Serial.println("[WiFi] not connected - reconnecting...");
+        WiFi.disconnect();
+        WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+      }
+      vTaskDelay(pdMS_TO_TICKS(250));
+      continue;
+    }
+    g_wifiOk = true;
+
+    // ---- One-time Firebase init once WiFi is up ----
+    if (!fbStarted) {
+      configTime(0, 0, "pool.ntp.org", "time.nist.gov");   // TLS/token needs valid time
+      config.api_key               = API_KEY;
+      config.database_url          = DATABASE_URL;
+      auth.user.email              = USER_EMAIL;
+      auth.user.password           = USER_PASSWORD;
+      config.token_status_callback = tokenStatusCallback;   // prints login/token status
+      fbdo.setBSSLBufferSize(4096, 1024);
+      Firebase.begin(&config, &auth);
+      fbStarted = true;
+      Serial.println("[Firebase] initialised, logging in...");
+    }
+
+    if (!Firebase.ready()) {
+      g_fbOk = false;
+      if (now - lastNotReadyMsg > 5000) {
+        lastNotReadyMsg = now;
+        Serial.println("[Firebase] not ready yet (logging in / token refresh)...");
+      }
+      vTaskDelay(pdMS_TO_TICKS(200));
+      continue;
+    }
+
+    // ---- Take the newest snapshot (skip if already uploaded) ----
+    GpsSnapshot s;
+    xSemaphoreTake(g_snapMutex, portMAX_DELAY);
+    s = g_snap;
+    xSemaphoreGive(g_snapMutex);
+
+    if (!s.ready || s.seq == lastSeq) {
+      vTaskDelay(pdMS_TO_TICKS(20));
+      continue;
+    }
+    lastSeq = s.seq;   // one attempt per snapshot; on failure the NEXT (fresh) one is sent
+
+    buildBody(s, body, sizeof(body));
+    json.clear();
+    json.setJsonData(body);
+
+#if USE_LEDS
+    digitalWrite(LED_SENDING, HIGH);
+#endif
+
+    const bool ok = Firebase.RTDB.updateNodeSilent(&fbdo, FB_PATH, &json);
+    g_lastHttpCode = fbdo.httpCode();
+
+    if (ok) {
+      g_fbOk = true;
+      g_fbOkCount++;
+    } else {
+      g_fbOk = false;
+      g_fbFailCount++;
+      Serial.printf("[Firebase] upload FAILED: %s (HTTP %d)\n",
+                    fbdo.errorReason().c_str(), fbdo.httpCode());
+      if (fbdo.httpCode() == 401 || fbdo.httpCode() == 403)
+        Serial.println("[Firebase] Permission denied - check Realtime Database RULES.");
+    }
+
+#if USE_LEDS
+    digitalWrite(LED_SENDING, LOW);
+#endif
+
+    vTaskDelay(pdMS_TO_TICKS(20));
+  }
+}
+
+// =====================================================================
+// SETUP / LOOP
+// =====================================================================
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+  Serial.println("\n=== MotoGuard ESP32: NEO-6M -> Firebase ===");
+
+#if USE_LEDS
+  pinMode(LED_GPS_FIX, OUTPUT);
+  pinMode(LED_SENDING, OUTPUT);
+  pinMode(LED_ERROR, OUTPUT);
+  digitalWrite(LED_GPS_FIX, LOW);
+  digitalWrite(LED_SENDING, LOW);
+  digitalWrite(LED_ERROR, HIGH);
+#endif
+
+  g_snapMutex = xSemaphoreCreateMutex();
+
+  gpsSerial.setRxBufferSize(1024);   // must be called BEFORE begin()
+  gpsSerial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+  Serial.printf("GPS UART2 started: RX=GPIO%d TX=GPIO%d @ %lu baud\n",
+                GPS_RX_PIN, GPS_TX_PIN, (unsigned long)GPS_BAUD);
+
+  // Non-blocking WiFi start: GPS keeps working even if WiFi never connects
+  WiFi.mode(WIFI_STA);
+  WiFi.persistent(false);
+  WiFi.setAutoReconnect(true);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.printf("WiFi connecting to \"%s\" in background...\n", WIFI_SSID);
+
+  xTaskCreatePinnedToCore(firebaseTask, "firebaseTask", 20480, nullptr, 1, nullptr, 0);
+
+  lastTickMs = millis();
+}
+
+void loop() {
+  // 1) Drain everything the GPS sent. Never blocks.
+  while (gpsSerial.available() > 0) {
+    char c = (char)gpsSerial.read();
+#if RAW_NMEA_DEBUG
+    Serial.write(c);
+#endif
+    gps.encode(c);
+  }
+
+  // 2) Once per second: validate + publish snapshot + print
+  const uint32_t now = millis();
+  if (now - lastTickMs >= 1000) {
+    lastTickMs = now;
+    tickGps();
+  }
+
+  delay(2);
+}
