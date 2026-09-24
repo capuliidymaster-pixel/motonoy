@@ -1,0 +1,859 @@
+import 'dart:async';
+
+import 'package:firebase_core/firebase_core.dart';
+import 'package:firebase_database/firebase_database.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter_map/flutter_map.dart';
+import 'package:geolocator/geolocator.dart';
+import 'package:latlong2/latlong.dart';
+
+// ======================================================================
+// CONFIGURATION
+// ======================================================================
+
+const String kDatabaseUrl =
+    'https://seretei8-default-rtdb.asia-southeast1.firebasedatabase.app';
+const String kDeviceId = 'motorcycle_001';
+
+/// Minimum satellites for the app to accept a fix as live.
+const int kMinSatellites = 4;
+
+/// If no NEW upload arrives from the ESP32 for this long -> DEVICE OFFLINE.
+const int kHeartbeatTimeoutMs = 8000;
+
+/// Max allowed difference between Firebase server time (updatedAt) and the
+/// GPS UTC time (deviceTimestamp). Larger = the GPS position is old.
+const int kDeviceClockToleranceMs = 10000;
+
+/// Show a grey "LAST KNOWN" marker when GPS is not live (never shown as live).
+const bool kShowLastKnownWhenLost = true;
+
+/// Show the phone's own location + distance/bearing to the motorcycle.
+const bool kShowPhone = true;
+
+/// Show a small diagnostics line (seq, ages) at the bottom of the screen.
+const bool kShowDebugLine = true;
+
+/// Only used as the initial camera position before any GPS data exists.
+const LatLng kDefaultCenter = LatLng(14.5995, 120.9842);
+
+// ======================================================================
+// MODEL
+// ======================================================================
+
+double? _asDouble(Object? v) {
+  if (v is num) {
+    final d = v.toDouble();
+    return d.isFinite ? d : null;
+  }
+  if (v is String) {
+    final d = double.tryParse(v.trim());
+    return (d != null && d.isFinite) ? d : null;
+  }
+  return null;
+}
+
+int? _asInt(Object? v) {
+  if (v is int) return v;
+  if (v is num) return v.toInt();
+  if (v is String) return int.tryParse(v.trim());
+  return null;
+}
+
+bool _asBool(Object? v) {
+  if (v is bool) return v;
+  if (v is String) return v.trim().toLowerCase() == 'true';
+  return false;
+}
+
+class MotoGpsData {
+  final double? latitude;
+  final double? longitude;
+  final double? altitude;
+  final double? speedKmh;
+  final double? accuracy;
+  final double? hdop;
+  final int? satellites;
+  final bool gpsFix;
+  final String status;
+  final int? deviceTimestamp; // GPS UTC, Unix ms
+  final int? updatedAt; // Firebase server time, Unix ms
+  final int? seq;
+
+  const MotoGpsData({
+    this.latitude,
+    this.longitude,
+    this.altitude,
+    this.speedKmh,
+    this.accuracy,
+    this.hdop,
+    this.satellites,
+    required this.gpsFix,
+    required this.status,
+    this.deviceTimestamp,
+    this.updatedAt,
+    this.seq,
+  });
+
+  factory MotoGpsData.fromMap(Map<Object?, Object?> m) {
+    return MotoGpsData(
+      latitude: _asDouble(m['latitude']),
+      longitude: _asDouble(m['longitude']),
+      altitude: _asDouble(m['altitude']),
+      speedKmh: _asDouble(m['speed']),
+      accuracy: _asDouble(m['accuracy']),
+      hdop: _asDouble(m['hdop']),
+      satellites: _asInt(m['satellites']),
+      gpsFix: _asBool(m['gpsFix']),
+      status: (m['status'] ?? 'UNKNOWN').toString(),
+      deviceTimestamp: _asInt(m['deviceTimestamp']),
+      updatedAt: _asInt(m['updatedAt']),
+      seq: _asInt(m['seq']),
+    );
+  }
+
+  bool get hasValidCoordinates {
+    final lat = latitude;
+    final lng = longitude;
+    if (lat == null || lng == null) return false;
+    if (lat < -90 || lat > 90 || lng < -180 || lng > 180) return false;
+    if (lat == 0 && lng == 0) return false; // "null island" = no real fix
+    return true;
+  }
+
+  LatLng? get position =>
+      hasValidCoordinates ? LatLng(latitude!, longitude!) : null;
+}
+
+enum GpsHealth {
+  waiting,
+  online,
+  gpsLost,
+  stale,
+  deviceOffline,
+  firebaseOffline,
+  firebaseError,
+}
+
+// ======================================================================
+// PAGE
+// ======================================================================
+
+class TrackPage extends StatefulWidget {
+  const TrackPage({super.key});
+
+  @override
+  State<TrackPage> createState() => _TrackPageState();
+}
+
+class _TrackPageState extends State<TrackPage>
+    with SingleTickerProviderStateMixin {
+  // ---- Firebase ----
+  late final FirebaseDatabase _db;
+  late final DatabaseReference _gpsRef;
+  StreamSubscription<DatabaseEvent>? _gpsSub;
+  StreamSubscription<DatabaseEvent>? _connSub;
+  StreamSubscription<DatabaseEvent>? _offsetSub;
+
+  bool _fbConnected = false;
+  int _serverOffsetMs =
+      0; // serverTime - phoneTime, from .info/serverTimeOffset
+  String? _dbError;
+
+  // ---- Latest motorcycle data ----
+  MotoGpsData? _data;
+  int? _lastSeq;
+  int? _lastUpdatedAt;
+  final Stopwatch _clock = Stopwatch()
+    ..start(); // monotonic, immune to clock changes
+  int _lastChangeMs = 0; // _clock time when a NEW upload was last received
+
+  // ---- Phone GPS ----
+  StreamSubscription<Position>? _phoneSub;
+  LatLng? _phoneLocation;
+  String _phoneStatus = 'Starting phone GPS...';
+
+  // ---- Map + marker animation ----
+  final MapController _mapController = MapController();
+  bool _mapReady = false;
+  bool _follow = true;
+  late final AnimationController _anim;
+  final ValueNotifier<LatLng?> _markerPos = ValueNotifier<LatLng?>(null);
+  LatLng? _animFrom;
+  LatLng? _animTo;
+
+  Timer? _ticker;
+
+  // ====================================================================
+  // LIFECYCLE
+  // ====================================================================
+
+  @override
+  void initState() {
+    super.initState();
+
+    _anim = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 900),
+    )..addListener(_onAnimTick);
+
+    _db = FirebaseDatabase.instanceFor(
+      app: Firebase.app(),
+      databaseURL: kDatabaseUrl,
+    );
+    _gpsRef = _db.ref('gps/$kDeviceId');
+
+    _connSub = _db.ref('.info/connected').onValue.listen((event) {
+      if (!mounted) return;
+      setState(() => _fbConnected = event.snapshot.value == true);
+    }, onError: (Object e) {
+      if (!mounted) return;
+      setState(() => _dbError = e.toString());
+    });
+
+    _offsetSub = _db.ref('.info/serverTimeOffset').onValue.listen((event) {
+      final v = event.snapshot.value;
+      if (v is num) _serverOffsetMs = v.toInt();
+    }, onError: (Object _) {});
+
+    _gpsSub = _gpsRef.onValue.listen(_onGpsEvent, onError: (Object e) {
+      if (!mounted) return;
+      setState(() => _dbError = e.toString());
+    });
+
+    // Re-evaluate GPS health every second, even if no new data arrives.
+    _ticker = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (mounted) setState(() {});
+    });
+
+    _startPhoneGps();
+  }
+
+  @override
+  void dispose() {
+    _gpsSub?.cancel();
+    _connSub?.cancel();
+    _offsetSub?.cancel();
+    _phoneSub?.cancel();
+    _ticker?.cancel();
+    _anim.dispose();
+    _markerPos.dispose();
+    _mapController.dispose();
+    super.dispose();
+  }
+
+  // ====================================================================
+  // PHONE GPS (optional)
+  // ====================================================================
+
+  void _setPhoneStatus(String s) {
+    if (!mounted) return;
+    setState(() => _phoneStatus = s);
+  }
+
+  Future<void> _startPhoneGps() async {
+    if (!kShowPhone) return;
+    try {
+      final enabled = await Geolocator.isLocationServiceEnabled();
+      if (!enabled) {
+        _setPhoneStatus('Phone location services disabled');
+        return;
+      }
+
+      var permission = await Geolocator.checkPermission();
+      if (permission == LocationPermission.denied) {
+        permission = await Geolocator.requestPermission();
+      }
+      if (permission == LocationPermission.denied ||
+          permission == LocationPermission.deniedForever) {
+        _setPhoneStatus('Phone location permission denied');
+        return;
+      }
+
+      const settings = LocationSettings(
+        accuracy: LocationAccuracy.high,
+        distanceFilter: 2,
+      );
+
+      _phoneSub = Geolocator.getPositionStream(locationSettings: settings)
+          .listen((pos) {
+        if (!mounted) return;
+        setState(() {
+          _phoneLocation = LatLng(pos.latitude, pos.longitude);
+          _phoneStatus = 'Phone GPS OK (±${pos.accuracy.toStringAsFixed(0)} m)';
+        });
+      }, onError: (Object e) {
+        _setPhoneStatus('Phone GPS error: $e');
+      });
+    } catch (e) {
+      _setPhoneStatus('Phone GPS error: $e');
+    }
+  }
+
+  // ====================================================================
+  // FIREBASE EVENTS
+  // ====================================================================
+
+  void _onGpsEvent(DatabaseEvent event) {
+    if (!mounted) return;
+
+    final value = event.snapshot.value;
+    if (value is! Map) {
+      // Node missing or wrong type: never crash, just show "waiting".
+      setState(() {
+        _data = null;
+        _dbError = null;
+      });
+      return;
+    }
+
+    final MotoGpsData data;
+    try {
+      data = MotoGpsData.fromMap(Map<Object?, Object?>.from(value));
+    } catch (e) {
+      setState(() => _dbError = 'Bad data format: $e');
+      return;
+    }
+
+    // Did a NEW upload arrive? (seq or server time changed)
+    if (_data == null ||
+        data.seq != _lastSeq ||
+        data.updatedAt != _lastUpdatedAt) {
+      _lastSeq = data.seq;
+      _lastUpdatedAt = data.updatedAt;
+      _lastChangeMs = _clock.elapsedMilliseconds;
+    }
+
+    setState(() {
+      _data = data;
+      _dbError = null;
+    });
+
+    // Only a LIVE, validated fix moves the marker.
+    if (_evaluate() == GpsHealth.online) {
+      final p = data.position;
+      if (p != null) _moveMarkerTo(p);
+    }
+  }
+
+  // ====================================================================
+  // GPS LIVE LOGIC
+  // ====================================================================
+
+  int _serverNowMs() => DateTime.now().millisecondsSinceEpoch + _serverOffsetMs;
+
+  int? _serverAgeMs() {
+    final u = _data?.updatedAt;
+    if (u == null) return null;
+    return _serverNowMs() - u;
+  }
+
+  GpsHealth _evaluate() {
+    if (_dbError != null) return GpsHealth.firebaseError;
+    if (!_fbConnected) return GpsHealth.firebaseOffline;
+
+    final data = _data;
+    if (data == null) return GpsHealth.waiting;
+
+    // 1) Is the ESP32 alive? (server-time heartbeat + local "silence" timer)
+    final silenceMs = _clock.elapsedMilliseconds - _lastChangeMs;
+    final serverAge = _serverAgeMs();
+    if (serverAge == null ||
+        serverAge > kHeartbeatTimeoutMs ||
+        silenceMs > kHeartbeatTimeoutMs) {
+      return GpsHealth.deviceOffline;
+    }
+
+    // 2) ESP32 is alive. Did it report a validated fix?
+    if (!data.gpsFix || data.status != 'GPS_ONLINE') {
+      return GpsHealth.gpsLost;
+    }
+
+    // 3) Fix reported: cross-check the data itself.
+    final sats = data.satellites ?? 0;
+    final devTs = data.deviceTimestamp;
+    final upAt = data.updatedAt;
+    final tsDiff =
+        (devTs == null || upAt == null) ? null : (upAt - devTs).abs();
+
+    if (!data.hasValidCoordinates ||
+        sats < kMinSatellites ||
+        tsDiff == null ||
+        tsDiff > kDeviceClockToleranceMs) {
+      return GpsHealth.stale;
+    }
+
+    return GpsHealth.online;
+  }
+
+  // ====================================================================
+  // MARKER ANIMATION + FOLLOW
+  // ====================================================================
+
+  void _moveMarkerTo(LatLng target) {
+    final current = _markerPos.value;
+
+    if (current == null) {
+      _markerPos.value = target;
+      _centerOn(target);
+      return;
+    }
+    if (current.latitude == target.latitude &&
+        current.longitude == target.longitude) {
+      return;
+    }
+
+    // Far jump (e.g. GPS came back after a long time): snap, don't glide.
+    final meters = const Distance().as(LengthUnit.Meter, current, target);
+    if (meters > 500) {
+      _anim.stop();
+      _markerPos.value = target;
+      if (_follow) _centerOn(target);
+      return;
+    }
+
+    _animFrom = current;
+    _animTo = target;
+    _anim.forward(from: 0);
+  }
+
+  void _onAnimTick() {
+    final from = _animFrom;
+    final to = _animTo;
+    if (from == null || to == null) return;
+    final t = _anim.value;
+    final p = LatLng(
+      from.latitude + (to.latitude - from.latitude) * t,
+      from.longitude + (to.longitude - from.longitude) * t,
+    );
+    _markerPos.value = p;
+    if (_follow) _centerOn(p);
+  }
+
+  void _centerOn(LatLng p) {
+    if (!_mapReady) return;
+    _mapController.move(p, _mapController.camera.zoom);
+  }
+
+  void _followMotorcycle() {
+    setState(() => _follow = true);
+    final p = _markerPos.value;
+    if (p != null && _mapReady) {
+      _mapController.move(p, 17);
+    }
+  }
+
+  // ====================================================================
+  // FORMATTING
+  // ====================================================================
+
+  String _fmtClock(int? ms) {
+    if (ms == null) return '--:--:--';
+    final d = DateTime.fromMillisecondsSinceEpoch(ms).toLocal();
+    String two(int n) => n.toString().padLeft(2, '0');
+    return '${two(d.hour)}:${two(d.minute)}:${two(d.second)}';
+  }
+
+  String _label(GpsHealth h) {
+    switch (h) {
+      case GpsHealth.online:
+        return 'ONLINE';
+      case GpsHealth.gpsLost:
+        return 'LOST';
+      case GpsHealth.stale:
+        return 'STALE';
+      case GpsHealth.deviceOffline:
+        return 'DEVICE OFFLINE';
+      case GpsHealth.firebaseOffline:
+        return 'FIREBASE OFFLINE';
+      case GpsHealth.firebaseError:
+        return 'DATABASE ERROR';
+      case GpsHealth.waiting:
+        return 'WAITING FOR DATA';
+    }
+  }
+
+  String _message(GpsHealth h) {
+    switch (h) {
+      case GpsHealth.online:
+        return '';
+      case GpsHealth.gpsLost:
+        return 'Waiting for GPS signal...';
+      case GpsHealth.stale:
+        return 'GPS data is not fresh or not reliable.';
+      case GpsHealth.deviceOffline:
+        return 'No updates from the tracker (ESP32 / WiFi).';
+      case GpsHealth.firebaseOffline:
+        return 'This phone is not connected to Firebase.';
+      case GpsHealth.firebaseError:
+        return _dbError ?? 'Database error.';
+      case GpsHealth.waiting:
+        return 'No GPS data in the database yet.';
+    }
+  }
+
+  Color _color(GpsHealth h) {
+    switch (h) {
+      case GpsHealth.online:
+        return Colors.greenAccent;
+      case GpsHealth.gpsLost:
+      case GpsHealth.stale:
+        return Colors.orangeAccent;
+      case GpsHealth.deviceOffline:
+      case GpsHealth.firebaseOffline:
+      case GpsHealth.firebaseError:
+        return Colors.redAccent;
+      case GpsHealth.waiting:
+        return Colors.grey;
+    }
+  }
+
+  /// Distance + bearing from the phone to the LIVE motorcycle position.
+  String? _distanceText(GpsHealth h) {
+    final phone = _phoneLocation;
+    final moto = _markerPos.value;
+    if (!kShowPhone || phone == null || moto == null) return null;
+    if (h != GpsHealth.online) return null;
+
+    final meters = const Distance().as(LengthUnit.Meter, phone, moto);
+    final bearing = (const Distance().bearing(phone, moto) + 360) % 360;
+    final d = meters < 1000
+        ? '${meters.toStringAsFixed(0)} m'
+        : '${(meters / 1000).toStringAsFixed(2)} km';
+    return '$d  •  ${bearing.toStringAsFixed(0)}°';
+  }
+
+  // ====================================================================
+  // UI
+  // ====================================================================
+
+  @override
+  Widget build(BuildContext context) {
+    final health = _evaluate();
+    final data = _data;
+    final online = health == GpsHealth.online;
+    final color = _color(health);
+    final distanceText = _distanceText(health);
+
+    return Scaffold(
+      backgroundColor: const Color(0xFF0D1117),
+      appBar: AppBar(
+        backgroundColor: const Color(0xFF161B22),
+        title: const Text(
+          'MOTO GUARD',
+          style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
+        ),
+        leading: IconButton(
+          icon: const Icon(Icons.arrow_back, color: Colors.orange),
+          onPressed: () => Navigator.pop(context),
+        ),
+      ),
+      body: Stack(
+        children: [
+          // ---------------- MAP ----------------
+          FlutterMap(
+            mapController: _mapController,
+            options: MapOptions(
+              initialCenter: _markerPos.value ?? kDefaultCenter,
+              initialZoom: 16,
+              onMapReady: () {
+                _mapReady = true;
+                final p = _markerPos.value;
+                if (p != null) _centerOn(p);
+              },
+              onPositionChanged: (camera, hasGesture) {
+                // User dragged/zoomed the map -> stop following.
+                if (hasGesture && _follow) {
+                  setState(() => _follow = false);
+                }
+              },
+            ),
+            children: [
+              TileLayer(
+                urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+                // Set this to your real applicationId (android/app/build.gradle).
+                userAgentPackageName: 'com.example.tracker',
+              ),
+              ValueListenableBuilder<LatLng?>(
+                valueListenable: _markerPos,
+                builder: (context, pos, _) {
+                  final h = _evaluate();
+                  final live = h == GpsHealth.online;
+                  final showMoto =
+                      pos != null && (live || kShowLastKnownWhenLost);
+                  final phone = _phoneLocation;
+                  return MarkerLayer(
+                    markers: [
+                      if (kShowPhone && phone != null)
+                        Marker(
+                          point: phone,
+                          width: 60,
+                          height: 60,
+                          child: const _PhoneMarker(),
+                        ),
+                      if (showMoto)
+                        Marker(
+                          point: pos,
+                          width: 90,
+                          height: 90,
+                          child: _MotorcycleMarker(live: live),
+                        ),
+                    ],
+                  );
+                },
+              ),
+            ],
+          ),
+
+          // ---------------- STATUS PANEL ----------------
+          Positioned(
+            top: 12,
+            left: 12,
+            right: 12,
+            child: Container(
+              padding: const EdgeInsets.all(14),
+              decoration: BoxDecoration(
+                color: const Color(0xFF161B22).withValues(alpha: 0.95),
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(color: color, width: 1.5),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Row(
+                    children: [
+                      Icon(Icons.circle, color: color, size: 14),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: Text(
+                          'GPS STATUS: ${_label(health)}',
+                          style: TextStyle(
+                            color: color,
+                            fontSize: 16,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                  if (!online) ...[
+                    const SizedBox(height: 4),
+                    Text(
+                      _message(health),
+                      style: const TextStyle(color: Colors.white70),
+                    ),
+                  ],
+                  const SizedBox(height: 8),
+                  _row('Satellites', data?.satellites?.toString() ?? '--'),
+                  _row(
+                    'Accuracy',
+                    online && data?.accuracy != null
+                        ? '${data!.accuracy!.toStringAsFixed(1)} m'
+                            '${data.hdop != null ? '  (HDOP ${data.hdop!.toStringAsFixed(2)})' : ''}'
+                        : '--',
+                  ),
+                  _row(
+                    'Speed',
+                    online && data?.speedKmh != null
+                        ? '${data!.speedKmh!.toStringAsFixed(1)} km/h'
+                        : '--',
+                  ),
+                  _row('Last Update', _fmtClock(data?.updatedAt)),
+                  if (!online && data?.deviceTimestamp != null)
+                    _row('Last GPS fix', _fmtClock(data!.deviceTimestamp)),
+                  if (kShowPhone) ...[
+                    _row('Phone → Moto', distanceText ?? '--'),
+                    Padding(
+                      padding: const EdgeInsets.only(top: 2),
+                      child: Text(
+                        _phoneStatus,
+                        style: const TextStyle(
+                          color: Colors.white38,
+                          fontSize: 11,
+                        ),
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+          ),
+
+          // ---------------- FOLLOW BUTTON ----------------
+          Positioned(
+            right: 16,
+            bottom: kShowDebugLine ? 56 : 24,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.end,
+              children: [
+                if (!_follow)
+                  Container(
+                    margin: const EdgeInsets.only(bottom: 6),
+                    padding:
+                        const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                    decoration: BoxDecoration(
+                      color: Colors.black87,
+                      borderRadius: BorderRadius.circular(6),
+                    ),
+                    child: const Text(
+                      'Tap to follow motorcycle',
+                      style: TextStyle(color: Colors.white, fontSize: 11),
+                    ),
+                  ),
+                FloatingActionButton(
+                  heroTag: 'followMoto',
+                  backgroundColor:
+                      _follow ? Colors.orange : const Color(0xFF161B22),
+                  foregroundColor: _follow ? Colors.black : Colors.orange,
+                  onPressed: _followMotorcycle,
+                  tooltip: 'Follow motorcycle',
+                  child: Icon(_follow ? Icons.gps_fixed : Icons.gps_not_fixed),
+                ),
+              ],
+            ),
+          ),
+
+          // ---------------- DEBUG LINE ----------------
+          if (kShowDebugLine)
+            Positioned(
+              left: 12,
+              right: 12,
+              bottom: 12,
+              child: Container(
+                padding: const EdgeInsets.all(8),
+                decoration: BoxDecoration(
+                  color: Colors.black.withValues(alpha: 0.7),
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: Text(
+                  _debugText(),
+                  style: const TextStyle(color: Colors.white70, fontSize: 10),
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  String _debugText() {
+    final d = _data;
+    if (d == null) {
+      return 'fb=${_fbConnected ? "connected" : "offline"}  no data';
+    }
+    final age = _serverAgeMs();
+    final diff = (d.updatedAt != null && d.deviceTimestamp != null)
+        ? ((d.updatedAt! - d.deviceTimestamp!) / 1000).toStringAsFixed(1)
+        : '?';
+    final silence = ((_clock.elapsedMilliseconds - _lastChangeMs) / 1000)
+        .toStringAsFixed(1);
+    return 'fb=${_fbConnected ? "connected" : "offline"}  seq=${d.seq ?? "?"}  '
+        'serverAge=${age == null ? "?" : (age / 1000).toStringAsFixed(1)}s  '
+        'noNewData=${silence}s  gpsVsServer=${diff}s  '
+        'status=${d.status}  fix=${d.gpsFix}';
+  }
+
+  Widget _row(String label, String value) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 1),
+      child: Row(
+        children: [
+          SizedBox(
+            width: 110,
+            child: Text('$label:',
+                style: const TextStyle(color: Colors.white60, fontSize: 13)),
+          ),
+          Expanded(
+            child: Text(
+              value,
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 13,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// ======================================================================
+// MARKER WIDGETS
+// ======================================================================
+
+class _MotorcycleMarker extends StatelessWidget {
+  final bool live;
+  const _MotorcycleMarker({required this.live});
+
+  @override
+  Widget build(BuildContext context) {
+    final c = live ? Colors.orange : Colors.grey;
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Container(
+          padding: const EdgeInsets.all(8),
+          decoration: BoxDecoration(
+            shape: BoxShape.circle,
+            color: c.withValues(alpha: 0.25),
+            border: Border.all(color: c, width: 2),
+          ),
+          child: Icon(Icons.motorcycle, color: c, size: 34),
+        ),
+        Container(
+          margin: const EdgeInsets.only(top: 2),
+          padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
+          color: Colors.black54,
+          child: Text(
+            live ? 'MOTORCYCLE' : 'LAST KNOWN',
+            style: TextStyle(
+              color: c,
+              fontSize: 9,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _PhoneMarker extends StatelessWidget {
+  const _PhoneMarker();
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Container(
+          padding: const EdgeInsets.all(6),
+          decoration: BoxDecoration(
+            shape: BoxShape.circle,
+            color: Colors.blue.withValues(alpha: 0.25),
+            border: Border.all(color: Colors.blue, width: 2),
+          ),
+          child: const Icon(Icons.phone_android, color: Colors.blue, size: 24),
+        ),
+        Container(
+          margin: const EdgeInsets.only(top: 2),
+          padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
+          color: Colors.black54,
+          child: const Text(
+            'PHONE',
+            style: TextStyle(
+              color: Colors.blue,
+              fontSize: 9,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+}
